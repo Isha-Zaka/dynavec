@@ -1,6 +1,14 @@
+import sys
 from unittest.mock import MagicMock
 
 import pytest
+
+if sys.version_info < (3, 10):
+    pytest.skip(
+        "LlamaIndex test dependencies are not compatible with Python 3.9",
+        allow_module_level=True,
+    )
+
 from llama_index.core.vector_stores.types import (
     FilterCondition,
     FilterOperator,
