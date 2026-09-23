@@ -42,6 +42,7 @@ sentence-transformers = ["sentence-transformers>=3.0"]
 # bedrock needs nothing beyond boto3.
 
 # --- Optional capabilities ---
+async = ["aioboto3>=13"]
 rerank = ["sentence-transformers>=3.0"]         # cross-encoder reranking
 redis = ["redis>=5.0"]                            # RedisCache / AWS ElastiCache
 mcp = ["mcp>=1.0; python_version >= '3.10'"]       # MCP client ingestion
