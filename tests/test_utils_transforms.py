@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from dynavec.transforms import TransformContext, TransformPipeline, as_pipeline
-from dynavec.utils import TokenBucket, chunked, is_retryable, retry
+from dynavec.utils import TokenBucket, async_retry, chunked, is_retryable, retry
 
 
 def test_chunked_generator():
@@ -162,3 +162,61 @@ def test_token_bucket_does_not_exceed_capacity():
 
         bucket.acquire()
         assert bucket.tokens == 1
+
+async def test_async_retry_retries_then_succeeds():
+    calls = {"n": 0}
+
+    class Throttle(Exception):
+        response = {"Error": {"Code": "ThrottlingException"}}
+
+    @async_retry(max_attempts=5, base_delay=0.0)
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise Throttle()
+        return "ok"
+
+    assert await flaky() == "ok"
+    assert calls["n"] == 3
+
+
+async def test_async_retry_does_not_retry_non_retryable():
+    calls = {"n": 0}
+
+    @async_retry(max_attempts=5, base_delay=0.0)
+    async def boom():
+        calls["n"] += 1
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError):
+        await boom()
+
+    assert calls["n"] == 1
+
+
+async def test_async_retry_uses_retry_delay(monkeypatch):
+    calls = {"n": 0}
+    delays = []
+
+    class Throttle(Exception):
+        response = {"Error": {"Code": "ThrottlingException"}}
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("dynavec.utils.asyncio.sleep", fake_sleep)
+
+    @async_retry(
+        max_attempts=3,
+        retry_delay=lambda exc: 3.0,
+    )
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Throttle()
+        return "ok"
+
+    assert await flaky() == "ok"
+    assert calls["n"] == 2
+    assert delays == [3.0]
+

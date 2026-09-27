@@ -6,11 +6,12 @@ agent frameworks (clear retries, optional latency hooks, lazy batching).
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import random
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Awaitable, Iterable, Iterator
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
@@ -79,6 +80,44 @@ def retry(
                     else:
                         delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
                         time.sleep(random.uniform(0, delay))  # full jitter
+
+        return wrapper
+
+    return decorator
+
+
+def async_retry(
+    max_attempts: int = 5,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    retry_on: Callable[[Exception], bool] = is_retryable,
+    retry_delay: Callable[[Exception], float | None] | None = None,
+) -> Callable[
+    [Callable[..., Awaitable[T]]],
+    Callable[..., Awaitable[T]],
+]:
+    """Async retry decorator with exponential backoff and full jitter."""
+
+    def decorator(
+        fn: Callable[..., Awaitable[T]],
+    ) -> Callable[..., Awaitable[T]]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            attempt = 0
+            while True:
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    attempt += 1
+                    if attempt >= max_attempts or not retry_on(exc):
+                        raise
+
+                    server_delay = retry_delay(exc) if retry_delay is not None else None
+                    if server_delay is not None:
+                        await asyncio.sleep(server_delay)
+                    else:
+                        delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                        await asyncio.sleep(random.uniform(0, delay))
 
         return wrapper
 
