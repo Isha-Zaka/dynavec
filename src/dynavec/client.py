@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Optional, TextIO, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, TextIO, Union, overload
 
 if TYPE_CHECKING:
     from .cache import BaseCache
@@ -40,6 +40,18 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+from .client_common import (
+    DDBPayload,
+    HotPayload,
+    S3Payload,
+    apply_transform_pipeline,
+    assign_embeddings,
+    build_write_payloads,
+    documents_to_embed,
+    embedding_texts,
+    s3_key,
+    split_key,
+)
 from .config import NS_METADATA_KEY, TEXT_METADATA_KEY, DynavecConfig
 from .credentials import AWSCredentials, resolve_session
 from .embeddings.base import Embedder
@@ -52,7 +64,7 @@ from .exceptions import (
 )
 from .graph import GraphStore
 from .hot import HotTier
-from .metadata import build_s3_filter, generate_auto_metadata, split_metadata
+from .metadata import build_s3_filter
 from .metrics import normalize_scores as normalize_metric_scores
 from .metrics import rescore as metric_rescore
 from .metrics import score as metric_score
@@ -68,10 +80,9 @@ from .namespace import NamespaceView
 from .provisioning import provision_all
 from .retrieval import distance_to_score, maximal_marginal_relevance, reciprocal_rank_fusion
 from .stores import DynamoDBStore, S3VectorsStore
-from .stores.dynamodb import check_item_size
 from .telemetry import TelemetryRecorder
-from .transforms import Transform, TransformContext, TransformPipeline, as_pipeline
-from .utils import KEY_SEPARATOR, chunked, decode_key_component, encode_key_component
+from .transforms import Transform, TransformPipeline, as_pipeline
+from .utils import chunked
 
 Metadata = dict[str, Any]
 _S3_PUT_CHUNK = 500
@@ -79,9 +90,6 @@ _DDB_CHUNK = 500
 
 RescoreSpec = Union[str, dict[str, float]]
 TransformSpec = Union[TransformPipeline, Transform, Iterable[Transform]]
-S3Payload = tuple[str, list[float], Metadata]
-DDBPayload = tuple[str, Optional[str], Metadata]
-HotPayload = tuple[str, list[float], Optional[str], Metadata]
 
 
 class Dynavec:
@@ -185,11 +193,10 @@ class Dynavec:
 
     # ------------------------------------------------------------- key helpers
     def _s3_key(self, namespace: str, doc_id: str) -> str:
-        return f"{encode_key_component(namespace)}{KEY_SEPARATOR}{encode_key_component(doc_id)}"
+        return s3_key(namespace, doc_id)
 
     def _split_key(self, key: str) -> tuple[str, str]:
-        namespace, _, doc_id = key.partition(KEY_SEPARATOR)
-        return decode_key_component(namespace), decode_key_component(doc_id)
+        return split_key(key)
 
     def _run_parallel(self, tasks: list[Callable[[], None]]) -> None:
         """Run zero-arg callables; parallel if enabled, else sequential."""
@@ -211,87 +218,49 @@ class Dynavec:
         auto_metadata: bool,
         transform: TransformSpec | None,
         default_ttl_seconds: int | None = None,
-    ) -> tuple[list[S3Payload], list[DDBPayload], list[str], list[HotPayload]]:
+    ) -> tuple[
+        list[S3Payload],
+        list[DDBPayload],
+        list[str],
+        list[HotPayload],
+    ]:
         pipeline = as_pipeline(transform) or self._default_transform
 
-        # 1) transforms may set/rewrite text, vector, metadata
-        if pipeline is not None:
-            for d in docs:
-                ctx = pipeline(
-                    TransformContext(
-                        id=d.id,
-                        text=d.text,
-                        vector=d.vector,
-                        metadata=dict(d.metadata),
-                        namespace=namespace,
-                    )
-                )
-                d.text, d.vector, d.metadata = ctx.text, ctx.vector, ctx.metadata
+        # 1) shared transform logic
+        apply_transform_pipeline(
+            docs,
+            namespace,
+            pipeline,
+        )
 
-        # 2) embed anything still missing a vector, in one batched call
-        to_embed = [(i, d.text) for i, d in enumerate(docs) if d.vector is None]
+        # 2) sync embedding stays specific to Dynavec
+        to_embed = documents_to_embed(docs)
+
         if to_embed:
             if self.embedder is None:
                 raise ConfigurationError(
                     "Some documents have no vector and no embedder is configured. "
                     "Pass an embedder to Dynavec(...) or provide precomputed vectors."
                 )
-            optional_texts = [t for _, t in to_embed]
-            if any(t is None for t in optional_texts):
-                raise ConfigurationError("A document has neither text nor vector.")
-            texts = [t for t in optional_texts if t is not None]
+
+            texts = embedding_texts(to_embed)
             vectors = self.embedder.embed_documents(texts)
-            for (idx, _), vec in zip(to_embed, vectors):
-                docs[idx].vector = vec
 
-        # 3) validate + build payloads
-        s3_payload: list[S3Payload] = []
-        ddb_payload: list[DDBPayload] = []
-        ids: list[str] = []
-        hot_payload: list[HotPayload] = []
-        for d in docs:
-            vector = d.vector
-            if vector is None:
-                raise ConfigurationError(f"Embedder did not return a vector for document {d.id!r}.")
-            if len(vector) != self.config.dimension:
-                raise DimensionMismatchError(
-                    f"Document {d.id!r} vector has dimension {len(vector)}, "
-                    f"expected {self.config.dimension}."
-                )
-            meta = dict(d.metadata)
-            if auto_metadata:
-                auto = generate_auto_metadata(d.text)
-                auto.update(meta)
-                meta = auto
-            s3_meta, ddb_meta = split_metadata(meta, self.config, namespace, d.text)
-            doc_ttl_seconds = d.ttl_seconds if d.ttl_seconds is not None else default_ttl_seconds
-            if doc_ttl_seconds is not None and doc_ttl_seconds <= 0:
-                raise ValueError(
-                    f"Document {d.id!r} ttl_seconds must be positive, got {doc_ttl_seconds}."
-                )
-            ttl_timestamp = (
-                int(time.time() + doc_ttl_seconds) if doc_ttl_seconds is not None else None
+            assign_embeddings(
+                docs,
+                to_embed,
+                vectors,
             )
-            if ttl_timestamp is not None:
-                ddb_meta["_ttl"] = ttl_timestamp
 
-            # fail before either store is written, not partway through a batch
-            check_item_size(
-                namespace,
-                d.id,
-                d.text,
-                ddb_meta,
-                self.config.gzip_threshold_bytes,
-                ttl=ttl_timestamp,
-                ttl_attribute=self.config.dynamodb_ttl_attribute,
-            )
-            s3_payload.append((self._s3_key(namespace, d.id), vector, s3_meta))
-            ddb_payload.append((d.id, d.text, ddb_meta))
-            ids.append(d.id)
-            # Hot tier keeps the full (merged) metadata + text so warmed
-            # namespaces need neither an S3 query nor a DynamoDB read.
-            hot_payload.append((d.id, vector, d.text, meta))
-        return s3_payload, ddb_payload, ids, hot_payload
+        # 3) shared validation + payload construction
+        return build_write_payloads(
+            docs,
+            self.config,
+            namespace,
+            auto_metadata,
+            default_ttl_seconds=default_ttl_seconds,
+        )
+
 
     def _write(
         self,
