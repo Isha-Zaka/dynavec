@@ -10,6 +10,10 @@ import pytest
 from dynavec.async_client import AsyncDynavec
 from dynavec.config import DynavecConfig
 from dynavec.embeddings.base import Embedder
+from dynavec.exceptions import (
+    ConfigurationError,
+    DimensionMismatchError,
+)
 
 
 def _config() -> DynavecConfig:
@@ -26,6 +30,22 @@ class AsyncOnlyEmbedder(Embedder):
 
     def __init__(self) -> None:
         self.async_calls: list[list[str]] = []
+        self.async_query_calls: list[str] = []
+
+    def embed_query(
+        self,
+        text: str,
+    ) -> list[float]:
+        raise AssertionError(
+            "AsyncDynavec must not call sync embed_query()."
+        )
+
+    async def aembed_query(
+        self,
+        text: str,
+    ) -> list[float]:
+        self.async_query_calls.append(text)
+        return [1.0, 2.0, 3.0, 4.0]
 
     def embed_documents(
         self,
@@ -420,3 +440,68 @@ async def test_partial_enter_failure_closes_first_store() -> None:
 
     assert vectors.entered
     assert vectors.exited
+
+
+async def test_resolve_query_vector_uses_precomputed_vector():
+    client, _, _ = _client()
+
+    vector = [0.1, 0.2, 0.3, 0.4]
+
+    result = await client._resolve_query_vector(
+        None,
+        vector,
+    )
+
+    assert result is vector
+
+
+async def test_resolve_query_vector_rejects_wrong_dimension():
+    client, _, _ = _client()
+
+    with pytest.raises(
+        DimensionMismatchError,
+        match="Query vector dimension",
+    ):
+        await client._resolve_query_vector(
+            None,
+            [0.1, 0.2],
+        )
+
+
+async def test_resolve_query_vector_requires_query_or_vector():
+    client, _, _ = _client()
+
+    with pytest.raises(
+        ValueError,
+        match="Provide either 'query' text or a 'vector'",
+    ):
+        await client._resolve_query_vector(
+            None,
+            None,
+        )
+
+
+async def test_resolve_query_vector_requires_embedder():
+    client, _, _ = _client()
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Text query requires an embedder",
+    ):
+        await client._resolve_query_vector(
+            "hello",
+            None,
+        )
+
+
+async def test_resolve_query_vector_uses_async_embedder():
+    embedder = AsyncOnlyEmbedder()
+    client, _, _ = _client(embedder=embedder)
+
+    result = await client._resolve_query_vector(
+        "hello",
+        None,
+    )
+
+    assert result == [1.0, 2.0, 3.0, 4.0]
+    assert embedder.async_query_calls == ["hello"]

@@ -24,7 +24,7 @@ from .client_common import (
 from .config import DynavecConfig
 from .credentials import AWSCredentials, resolve_async_session
 from .embeddings.base import Embedder
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, DimensionMismatchError
 from .hot import HotTier
 from .models import Document, UpsertResult
 from .stores.async_dynamodb import AsyncDynamoDBStore
@@ -147,6 +147,33 @@ class AsyncDynavec:
             and self.config.cache_invalidate_on_write
         ):
             self._cache.invalidate(namespace)
+
+    async def _resolve_query_vector(
+        self,
+        query: str | None,
+        vector: list[float] | None,
+    ) -> list[float]:
+        if vector is not None:
+            if len(vector) != self.config.dimension:
+                raise DimensionMismatchError(
+                    f"Query vector dimension {len(vector)} "
+                    f"!= {self.config.dimension}."
+                )
+            return vector
+
+        if query is None:
+            raise ValueError(
+                "Provide either 'query' text or a 'vector'."
+            )
+
+        if self.embedder is None:
+            raise ConfigurationError(
+                "Text query requires an embedder. "
+                "Pass one to AsyncDynavec(...) or query "
+                "with a precomputed 'vector'."
+            )
+
+        return await self.embedder.aembed_query(query)
 
     async def _prepare(
         self,
