@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from dynavec.async_client import AsyncDynavec
+from dynavec.client_common import s3_key
 from dynavec.config import DynavecConfig
 from dynavec.embeddings.base import Embedder
 from dynavec.exceptions import (
@@ -74,6 +75,28 @@ class FakeVectorStore:
         self.put_calls: list[
             tuple[list[tuple[str, list[float], dict[str, Any]]], int]
         ] = []
+        self.query_results: list[dict[str, Any]] = []
+        self.query_calls: list[dict[str, Any]] = []
+
+    async def query(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        filter: dict[str, Any] | None = None,
+        return_metadata: bool = True,
+        return_distance: bool = True,
+    ) -> list[dict[str, Any]]:
+        self.query_calls.append(
+            {
+                "query_vector": query_vector,
+                "top_k": top_k,
+                "filter": filter,
+                "return_metadata": return_metadata,
+                "return_distance": return_distance,
+            }
+        )
+
+        return self.query_results
 
     async def __aenter__(self) -> FakeVectorStore:
         self.entered = True
@@ -115,6 +138,26 @@ class FakeDocumentStore:
                 ],
             ]
         ] = []
+        self.documents: dict[str, dict[str, Any]] = {}
+        self.get_calls: list[tuple[str, list[str]]] = []
+
+    async def get_many(
+        self,
+        namespace: str,
+        ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        self.get_calls.append(
+            (
+                namespace,
+                ids,
+            )
+        )
+
+        return {
+            doc_id: self.documents[doc_id]
+            for doc_id in ids
+            if doc_id in self.documents
+        }
 
     async def __aenter__(
         self,
@@ -505,3 +548,81 @@ async def test_resolve_query_vector_uses_async_embedder():
 
     assert result == [1.0, 2.0, 3.0, 4.0]
     assert embedder.async_query_calls == ["hello"]
+
+
+async def test_asearch_queries_and_hydrates_results():
+    client, vectors, documents = _client()
+
+    vectors.query_results = [
+        {
+            "key": s3_key("default", "doc-1"),
+            "distance": 0.2,
+        },
+        {
+            "key": s3_key("default", "doc-2"),
+            "distance": 0.4,
+        },
+    ]
+
+    documents.documents = {
+        "doc-1": {
+            "text": "First document",
+            "metadata": {"topic": "python"},
+            "ttl": 1_700_000_060,
+        },
+        "doc-2": {
+            "text": "Second document",
+            "metadata": {"topic": "asyncio"},
+        },
+    }
+
+    async with client:
+        results = await client.asearch(
+            vector=[0.1, 0.2, 0.3, 0.4],
+            top_k=2,
+        )
+
+    assert [result.id for result in results] == [
+        "doc-1",
+        "doc-2",
+    ]
+
+    assert results[0].distance == 0.2
+    assert results[0].text == "First document"
+    assert results[0].metadata == {"topic": "python"}
+    assert results[0].ttl == 1_700_000_060
+
+    assert results[1].distance == 0.4
+    assert results[1].text == "Second document"
+    assert results[1].metadata == {"topic": "asyncio"}
+    assert results[1].ttl is None
+
+    assert documents.get_calls == [
+        (
+            "default",
+            ["doc-1", "doc-2"],
+        )
+    ]
+
+    assert len(vectors.query_calls) == 1
+    assert vectors.query_calls[0]["query_vector"] == [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+    ]
+    assert vectors.query_calls[0]["top_k"] == 2
+
+
+async def test_asearch_returns_empty_when_vector_search_has_no_hits():
+    client, vectors, documents = _client()
+
+    vectors.query_results = []
+
+    async with client:
+        results = await client.asearch(
+            vector=[0.1, 0.2, 0.3, 0.4],
+        )
+
+    assert results == []
+    assert documents.get_calls == []

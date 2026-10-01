@@ -20,19 +20,23 @@ from .client_common import (
     build_write_payloads,
     documents_to_embed,
     embedding_texts,
+    split_key,
 )
 from .config import DynavecConfig
 from .credentials import AWSCredentials, resolve_async_session
 from .embeddings.base import Embedder
 from .exceptions import ConfigurationError, DimensionMismatchError
 from .hot import HotTier
-from .models import Document, UpsertResult
+from .metadata import build_s3_filter
+from .models import Document, SearchResult, UpsertResult
+from .retrieval import distance_to_score
 from .stores.async_dynamodb import AsyncDynamoDBStore
 from .stores.async_s3vectors import AsyncS3VectorsStore
 from .telemetry import TelemetryRecorder
 from .transforms import Transform, TransformPipeline, as_pipeline
 
 TransformSpec = Union[TransformPipeline, Transform, Iterable[Transform]]
+Metadata = dict[str, Any]
 
 
 class AsyncDynavec:
@@ -174,6 +178,77 @@ class AsyncDynavec:
             )
 
         return await self.embedder.aembed_query(query)
+
+    async def asearch(
+        self,
+        query: str | None = None,
+        *,
+        vector: list[float] | None = None,
+        top_k: int = 10,
+        namespace: str = "default",
+        filter: Metadata | None = None,
+    ) -> list[SearchResult]:
+        """Search asynchronously using query text or a precomputed vector."""
+        self._require_open()
+
+        query_vector = await self._resolve_query_vector(
+            query,
+            vector,
+        )
+
+        raw = await self._vectors.query(
+            query_vector=query_vector,
+            top_k=top_k,
+            filter=build_s3_filter(
+                filter,
+                namespace,
+            ),
+            return_metadata=True,
+            return_distance=True,
+        )
+
+        if not raw:
+            return []
+
+        hits = [
+            (
+                split_key(item["key"])[1],
+                item.get("distance"),
+            )
+            for item in raw
+        ]
+
+        ids = [doc_id for doc_id, _ in hits]
+
+        hydrated = await self._docs.get_many(
+            namespace,
+            ids,
+        )
+
+        results: list[SearchResult] = []
+
+        for doc_id, distance in hits:
+            doc = hydrated.get(doc_id, {})
+
+            results.append(
+                SearchResult(
+                    id=doc_id,
+                    score=(
+                        distance_to_score(
+                            distance,
+                            self.config.distance_metric,
+                        )
+                        if distance is not None
+                        else 0.0
+                    ),
+                    distance=distance,
+                    text=doc.get("text"),
+                    metadata=doc.get("metadata", {}),
+                    ttl=doc.get("ttl"),
+                )
+            )
+
+        return results
 
     async def _prepare(
         self,
