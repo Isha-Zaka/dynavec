@@ -9,7 +9,7 @@ import pytest
 
 from dynavec.async_client import AsyncDynavec
 from dynavec.client_common import s3_key
-from dynavec.config import DynavecConfig
+from dynavec.config import NS_METADATA_KEY, DynavecConfig
 from dynavec.embeddings.base import Embedder
 from dynavec.exceptions import (
     ConfigurationError,
@@ -626,3 +626,23 @@ async def test_asearch_returns_empty_when_vector_search_has_no_hits():
 
     assert results == []
     assert documents.get_calls == []
+
+
+async def test_asearch_passes_namespace_and_filter_to_vector_store():
+    client, vectors, _ = _client()
+
+    vectors.query_results = []
+
+    async with client:
+        await client.asearch(
+            vector=[0.1, 0.2, 0.3, 0.4],
+            namespace="tenant-a",
+            filter={"topic": "python"},
+        )
+
+    assert vectors.query_calls[0]["filter"] == {
+        "$and": [
+            {"topic": "python"},
+            {NS_METADATA_KEY: "tenant-a"},
+        ]
+    }
