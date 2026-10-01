@@ -182,22 +182,37 @@ class TokenBucket:
         self._lock = threading.Lock()
 
 
+    def _acquire_wait_time(self) -> float | None:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_time
+
+            self.tokens = min(
+                self.capacity,
+                self.tokens + elapsed * self.rate,
+            )
+            self.last_time = now
+
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return None
+
+            return (1 - self.tokens) / self.rate
+
     def acquire(self) -> None:
         while True:
-            with self._lock:
-                now = time.monotonic()
-                elapsed = now - self.last_time
+            wait_time = self._acquire_wait_time()
 
-                self.tokens = min(
-                    self.capacity,
-                    self.tokens + elapsed * self.rate,
-                )
-                self.last_time = now
-
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-
-                wait_time = (1 - self.tokens) / self.rate
+            if wait_time is None:
+                return
 
             time.sleep(wait_time)
+
+    async def acquire_async(self) -> None:
+        while True:
+            wait_time = self._acquire_wait_time()
+
+            if wait_time is None:
+                return
+
+            await asyncio.sleep(wait_time)

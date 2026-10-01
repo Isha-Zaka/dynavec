@@ -373,6 +373,48 @@ async def test_operations_require_open_store():
         )
 
 
+async def test_get_many_returns_ttl():
+    config = DynavecConfig(
+        vector_bucket="bucket",
+        index="index",
+        table="docs",
+        dimension=8,
+        dynamodb_ttl_attribute="expires_at",
+    )
+
+    table = FakeTable()
+    resource = FakeDynamoResource(
+        table,
+        responses=[
+            {
+                "Responses": {
+                    "docs": [
+                        {
+                            "id": "a",
+                            "text": "First",
+                            "metadata": {
+                                "topic": "test",
+                            },
+                            "expires_at": Decimal("1700000060"),
+                        }
+                    ]
+                },
+                "UnprocessedKeys": {},
+            }
+        ],
+    )
+
+    session = FakeSession(resource)
+
+    async with AsyncDynamoDBStore(config, session) as store:
+        documents = await store.get_many(
+            "tenant",
+            ["a"],
+        )
+
+    assert documents["a"]["ttl"] == 1_700_000_060
+
+
 async def test_enter_closes_resource_if_table_creation_fails():
     table = FakeTable()
     resource = FakeDynamoResource(table)

@@ -163,6 +163,43 @@ def test_token_bucket_does_not_exceed_capacity():
         bucket.acquire()
         assert bucket.tokens == 1
 
+
+async def test_token_bucket_async_waits_for_token(
+    monkeypatch,
+):
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        "dynavec.utils.asyncio.sleep",
+        fake_sleep,
+    )
+
+    with patch(
+        "dynavec.utils.time.monotonic",
+        side_effect=[
+            100.0,
+            100.0,
+            100.0,
+            100.05,
+            100.11,
+        ],
+    ):
+        bucket = TokenBucket(
+            rate=10,
+            capacity=2,
+        )
+
+        await bucket.acquire_async()
+        await bucket.acquire_async()
+        await bucket.acquire_async()
+
+    assert delays == [pytest.approx(0.05)]
+    assert bucket.tokens == pytest.approx(0.1)
+
+
 async def test_async_retry_retries_then_succeeds():
     calls = {"n": 0}
 
@@ -219,4 +256,3 @@ async def test_async_retry_uses_retry_delay(monkeypatch):
     assert await flaky() == "ok"
     assert calls["n"] == 2
     assert delays == [3.0]
-

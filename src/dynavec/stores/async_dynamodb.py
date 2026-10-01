@@ -220,12 +220,18 @@ class AsyncDynamoDBStore:
                     self._config.table,
                     [],
                 ):
-                    out[item["id"]] = {
+                    entry: dict[str, Any] = {
                         "text": _read_text(item),
                         "metadata": _from_dynamo(
                             item.get("metadata", {})
                         ),
                     }
+
+                    ttl_attr = self._config.dynamodb_ttl_attribute
+                    if ttl_attr in item:
+                        entry["ttl"] = int(item[ttl_attr])
+
+                    out[item["id"]] = entry
 
                 unprocessed = (
                     response.get("UnprocessedKeys") or {}

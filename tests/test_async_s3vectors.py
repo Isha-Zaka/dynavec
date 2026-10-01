@@ -2,6 +2,7 @@
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -184,7 +185,8 @@ async def test_query_returns_paginated_results():
             "vectors": [
                 {"key": f"k{i}", "distance": i * 0.01}
                 for i in range(100)
-            ]
+            ],
+            "NextToken": "token-1",
         },
         {
             "vectors": [
@@ -214,7 +216,8 @@ async def test_query_truncates_at_top_k():
             "vectors": [
                 {"key": f"k{i}"}
                 for i in range(100)
-            ]
+            ],
+            "NextToken": "token-1",
         },
         {
             "vectors": [
@@ -276,6 +279,80 @@ async def test_query_rejects_excessive_top_k():
                 [0.1, 0.2, 0.3, 0.4],
                 top_k=10_001,
             )
+
+
+async def test_put_batch_uses_rate_limiter():
+    config = DynavecConfig(
+        vector_bucket="test-bucket",
+        index="test-index",
+        table="test-table",
+        dimension=4,
+        put_rps=10,
+    )
+
+    client = FakeS3Client()
+    session = FakeSession(client)
+
+    async with AsyncS3VectorsStore(config, session) as store:
+        limiter = AsyncMock()
+        store._put_limiter = limiter
+
+        payload = [
+            {
+                "key": "key-1",
+                "data": {
+                    "float32": [0.1, 0.2, 0.3, 0.4],
+                },
+                "metadata": {},
+            }
+        ]
+
+        await store._put_batch(payload)
+
+    limiter.acquire_async.assert_awaited_once_with()
+    assert len(client.put_calls) == 1
+
+
+async def test_query_pages_uses_rate_limiter_per_page():
+    pages = [
+        {
+            "vectors": [{"key": "k0"}],
+            "NextToken": "token-1",
+        },
+        {
+            "vectors": [{"key": "k1"}],
+            "NextToken": "token-2",
+        },
+        {
+            "vectors": [{"key": "k2"}],
+        },
+    ]
+
+    config = DynavecConfig(
+        vector_bucket="test-bucket",
+        index="test-index",
+        table="test-table",
+        dimension=4,
+        query_rps=10,
+    )
+
+    client = FakeS3Client(pages)
+    session = FakeSession(client)
+
+    async with AsyncS3VectorsStore(config, session) as store:
+        limiter = AsyncMock()
+        store._query_limiter = limiter
+
+        result_pages = [
+            page
+            async for page in store.query_pages(
+                [0.1, 0.2, 0.3, 0.4],
+                top_k=3,
+            )
+        ]
+
+    assert [len(page) for page in result_pages] == [1, 1, 1]
+    assert limiter.acquire_async.await_count == 3
 
 
 async def test_get_vectors_batches_keys():

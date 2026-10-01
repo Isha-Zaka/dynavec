@@ -11,7 +11,7 @@ from typing import Any
 
 from ..config import DynavecConfig
 from ..logging import log_store_event
-from ..utils import async_retry
+from ..utils import TokenBucket, async_retry
 from .s3vectors import _GET_LIMIT, _MAX_TOP_K, _PUT_LIMIT, Metadata, _f32
 
 
@@ -23,6 +23,16 @@ class AsyncS3VectorsStore:
     def __init__(self, config: DynavecConfig, boto_session: Any) -> None:
         self._config = config
         self._session = boto_session
+        self._put_limiter = (
+            TokenBucket(config.put_rps)
+            if config.put_rps is not None
+            else None
+        )
+        self._query_limiter = (
+            TokenBucket(config.query_rps)
+            if config.query_rps is not None
+            else None
+        )
         self._client_context: Any | None = None
         self._client: Any | None = None
 
@@ -80,7 +90,13 @@ class AsyncS3VectorsStore:
         return self._client
 
     @async_retry()
-    async def _put_batch(self, payload: list[dict[str, Any]]) -> None:
+    async def _put_batch(
+        self,
+        payload: list[dict[str, Any]],
+    ) -> None:
+        if self._put_limiter is not None:
+            await self._put_limiter.acquire_async()
+
         client = self._require_client()
         await client.put_vectors(
             vectorBucketName=self._config.vector_bucket,
@@ -272,47 +288,58 @@ class AsyncS3VectorsStore:
         yielded = 0
         buffer: list[dict[str, Any]] = []
 
-        async for page in paginator.paginate(
+        page_iterator = paginator.paginate(
             PaginationConfig={"MaxItems": top_k},
             **kwargs,
-        ):
+        ).__aiter__()
+
+        while True:
+            if self._query_limiter is not None:
+                await self._query_limiter.acquire_async()
+
+            try:
+                page = await page_iterator.__anext__()
+            except StopAsyncIteration:
+                break
+
             vectors = page.get("vectors", [])
 
-            if not vectors:
-                continue
-
-            if effective_page_size is None:
-                remaining = top_k - yielded
-
-                if len(vectors) > remaining:
-                    vectors = vectors[:remaining]
-
-                yield vectors
-                yielded += len(vectors)
-
-                if yielded >= top_k:
-                    return
-
-            else:
-                buffer.extend(vectors)
-
-                while (
-                    len(buffer) >= effective_page_size
-                    and yielded < top_k
-                ):
-                    chunk = buffer[:effective_page_size]
-                    buffer = buffer[effective_page_size:]
-
+            if vectors:
+                if effective_page_size is None:
                     remaining = top_k - yielded
 
-                    if len(chunk) > remaining:
-                        chunk = chunk[:remaining]
+                    if len(vectors) > remaining:
+                        vectors = vectors[:remaining]
 
-                    yield chunk
-                    yielded += len(chunk)
+                    yield vectors
+                    yielded += len(vectors)
 
                     if yielded >= top_k:
                         return
+
+                else:
+                    buffer.extend(vectors)
+
+                    while (
+                        len(buffer) >= effective_page_size
+                        and yielded < top_k
+                    ):
+                        chunk = buffer[:effective_page_size]
+                        buffer = buffer[effective_page_size:]
+
+                        remaining = top_k - yielded
+
+                        if len(chunk) > remaining:
+                            chunk = chunk[:remaining]
+
+                        yield chunk
+                        yielded += len(chunk)
+
+                        if yielded >= top_k:
+                            return
+
+            if page.get("NextToken") is None:
+                break
 
         if (
             effective_page_size is not None
@@ -321,6 +348,7 @@ class AsyncS3VectorsStore:
         ):
             remaining = top_k - yielded
             yield buffer[:remaining]
+
 
     @async_retry()
     async def get_vectors(
