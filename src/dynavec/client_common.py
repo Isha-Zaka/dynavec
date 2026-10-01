@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Optional
 
 from .config import DynavecConfig
 from .exceptions import ConfigurationError, DimensionMismatchError
@@ -15,9 +15,9 @@ from .utils import KEY_SEPARATOR, decode_key_component, encode_key_component
 
 Metadata = dict[str, Any]
 S3Payload = tuple[str, list[float], Metadata]
-DDBPayload = tuple[str, str | None, Metadata]
-HotPayload = tuple[str, list[float], str | None, Metadata]
-EmbeddingTarget = tuple[int, str | None]
+DDBPayload = tuple[str, Optional[str], Metadata]
+HotPayload = tuple[str, list[float], Optional[str], Metadata]
+EmbeddingTarget = tuple[int, Optional[str]]
 
 
 def s3_key(namespace: str, doc_id: str) -> str:
