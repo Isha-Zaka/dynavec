@@ -257,6 +257,52 @@ async def test_aupsert_uses_async_embedding_and_writes_both_stores() -> None:
     assert document_payload[0][1] == "hello"
 
 
+async def test_aupsert_passes_default_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, documents = _client()
+
+    monkeypatch.setattr(
+        "dynavec.client_common.time.time",
+        lambda: 1_700_000_000,
+    )
+
+    async with client:
+        await client.aupsert(
+            [
+                {
+                    "id": "a",
+                    "vector": [1.0, 2.0, 3.0, 4.0],
+                }
+            ],
+            namespace="tenant",
+            ttl_seconds=60,
+        )
+
+    namespace, document_payload = documents.put_calls[0]
+
+    assert namespace == "tenant"
+    assert document_payload[0][2]["_ttl"] == 1_700_000_060
+
+
+async def test_aupsert_rejects_non_positive_ttl() -> None:
+    client, _, _ = _client()
+
+    with pytest.raises(
+        ValueError,
+        match="ttl_seconds must be positive",
+    ):
+        await client.aupsert(
+            [
+                {
+                    "id": "a",
+                    "vector": [1.0, 2.0, 3.0, 4.0],
+                }
+            ],
+            ttl_seconds=0,
+        )
+
+
 async def test_aupsert_runs_s3_and_dynamodb_writes_concurrently() -> None:
     s3_started = asyncio.Event()
     ddb_started = asyncio.Event()

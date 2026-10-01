@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from .client_common import (
     DDBPayload,
+    HotPayload,
     S3Payload,
     apply_transform_pipeline,
     assign_embeddings,
@@ -153,18 +154,12 @@ class AsyncDynavec:
         namespace: str,
         auto_metadata: bool,
         transform: TransformSpec | None,
+        default_ttl_seconds: int | None = None,
     ) -> tuple[
         list[S3Payload],
         list[DDBPayload],
         list[str],
-        list[
-            tuple[
-                str,
-                list[float],
-                str | None,
-                dict[str, Any],
-            ]
-        ],
+        list[HotPayload],
     ]:
         pipeline = (
             as_pipeline(transform)
@@ -204,6 +199,7 @@ class AsyncDynavec:
             self.config,
             namespace,
             auto_metadata,
+            default_ttl_seconds=default_ttl_seconds,
         )
 
     async def aupsert(
@@ -216,8 +212,14 @@ class AsyncDynavec:
         namespace: str = "default",
         auto_metadata: bool = False,
         transform: TransformSpec | None = None,
+        ttl_seconds: int | None = None,
     ) -> UpsertResult:
         """Insert or overwrite documents asynchronously."""
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError(
+                f"ttl_seconds must be positive, got {ttl_seconds}."
+            )
+
         if not documents:
             return UpsertResult(
                 count=0,
@@ -243,6 +245,7 @@ class AsyncDynavec:
             namespace,
             auto_metadata,
             transform,
+            default_ttl_seconds=ttl_seconds,
         )
 
         await asyncio.gather(

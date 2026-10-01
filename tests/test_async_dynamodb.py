@@ -164,6 +164,41 @@ async def test_put_many_builds_and_writes_items():
     )
 
 
+async def test_put_many_writes_custom_ttl_attribute():
+    config = DynavecConfig(
+        vector_bucket="bucket",
+        index="index",
+        table="docs",
+        dimension=8,
+        dynamodb_ttl_attribute="expires_at",
+    )
+
+    table = FakeTable()
+    resource = FakeDynamoResource(table)
+    session = FakeSession(resource)
+
+    async with AsyncDynamoDBStore(config, session) as store:
+        await store.put_many(
+            "tenant",
+            [
+                (
+                    "a",
+                    "First",
+                    {
+                        "topic": "test",
+                        "_ttl": 1_700_000_060,
+                    },
+                )
+            ],
+        )
+
+    item = table.writer.items[0]
+
+    assert item["expires_at"] == 1_700_000_060
+    assert "_ttl" not in item["metadata"]
+    assert item["metadata"]["topic"] == "test"
+
+
 async def test_put_many_rejects_oversized_item_before_writing():
     table = FakeTable()
     resource = FakeDynamoResource(table)

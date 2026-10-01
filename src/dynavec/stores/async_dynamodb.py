@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Any
 
@@ -122,21 +123,28 @@ class AsyncDynamoDBStore:
     async def put_many(
         self,
         namespace: str,
-        items: list[tuple[str, str | None, Metadata]],
+        items: Sequence[
+            tuple[str, str | None, Metadata]
+            | tuple[str, str | None, Metadata, int | None]
+        ],
     ) -> None:
-        """Upsert document triples using DynamoDB's async batch writer."""
+        """Upsert document tuples using DynamoDB's async batch writer."""
         t0 = time.perf_counter()
 
         threshold = self._config.gzip_threshold_bytes
+        ttl_attr = self._config.dynamodb_ttl_attribute
+
         built = [
             _build_item(
                 namespace,
-                doc_id,
-                text,
-                metadata,
+                item[0],
+                item[1],
+                item[2],
                 threshold,
+                ttl=item[3] if len(item) > 3 else None,
+                ttl_attribute=ttl_attr,
             )
-            for doc_id, text, metadata in items
+            for item in items
         ]
 
         for item in built:
@@ -157,7 +165,10 @@ class AsyncDynamoDBStore:
             table=self._config.table,
             namespace=namespace,
             count=len(items),
-            duration_ms=round((time.perf_counter() - t0) * 1000, 2),
+            duration_ms=round(
+                (time.perf_counter() - t0) * 1000,
+                2,
+            ),
         )
 
     @async_retry()
