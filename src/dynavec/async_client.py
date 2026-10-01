@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import AsyncExitStack
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
@@ -249,6 +249,79 @@ class AsyncDynavec:
             )
 
         return results
+
+    async def asearch_stream(
+        self,
+        query: str | None = None,
+        *,
+        vector: list[float] | None = None,
+        top_k: int = 50,
+        namespace: str = "default",
+        filter: Metadata | None = None,
+        page_size: int | None = None,
+    ) -> AsyncIterator[SearchResult]:
+        """Stream search results asynchronously page by page."""
+        self._require_open()
+
+        query_vector = await self._resolve_query_vector(
+            query,
+            vector,
+        )
+
+        yielded = 0
+
+        effective_page_size = (
+            page_size
+            if page_size is not None
+            else self.config.top_k_page_size
+        )
+
+        async for page in self._vectors.query_pages(
+            query_vector=query_vector,
+            top_k=top_k,
+            filter=build_s3_filter(
+                filter,
+                namespace,
+            ),
+            return_metadata=True,
+            return_distance=True,
+            page_size=effective_page_size,
+        ):
+            page_hits = [
+                (
+                    split_key(item["key"])[1],
+                    item.get("distance"),
+                )
+                for item in page
+            ]
+
+            hydrated = await self._docs.get_many(
+                namespace,
+                [doc_id for doc_id, _ in page_hits],
+            )
+
+            for doc_id, distance in page_hits:
+                if yielded >= top_k:
+                    return
+
+                doc = hydrated.get(doc_id, {})
+
+                yield SearchResult(
+                    id=doc_id,
+                    score=(
+                        distance_to_score(
+                            distance,
+                            self.config.distance_metric,
+                        )
+                        if distance is not None
+                        else 0.0
+                    ),
+                    distance=distance,
+                    text=doc.get("text"),
+                    metadata=doc.get("metadata", {}),
+                )
+
+                yielded += 1
 
     async def _prepare(
         self,

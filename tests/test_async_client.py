@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -77,6 +78,8 @@ class FakeVectorStore:
         ] = []
         self.query_results: list[dict[str, Any]] = []
         self.query_calls: list[dict[str, Any]] = []
+        self.query_page_results: list[list[dict[str, Any]]] = []
+        self.query_page_calls: list[dict[str, Any]] = []
 
     async def query(
         self,
@@ -120,6 +123,29 @@ class FakeVectorStore:
         self.put_calls.append(
             (vectors, max_workers)
         )
+
+    async def query_pages(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        filter: dict[str, Any] | None = None,
+        return_metadata: bool = True,
+        return_distance: bool = True,
+        page_size: int | None = None,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        self.query_page_calls.append(
+            {
+                "query_vector": query_vector,
+                "top_k": top_k,
+                "filter": filter,
+                "return_metadata": return_metadata,
+                "return_distance": return_distance,
+                "page_size": page_size,
+            }
+        )
+
+        for page in self.query_page_results:
+            yield page
 
 
 class FakeDocumentStore:
@@ -646,3 +672,124 @@ async def test_asearch_passes_namespace_and_filter_to_vector_store():
             {NS_METADATA_KEY: "tenant-a"},
         ]
     }
+
+
+async def test_asearch_stream_yields_results_page_by_page():
+    client, vectors, documents = _client()
+
+    vectors.query_page_results = [
+        [
+            {
+                "key": s3_key("tenant-a", "doc-1"),
+                "distance": 0.1,
+            },
+            {
+                "key": s3_key("tenant-a", "doc-2"),
+                "distance": 0.2,
+            },
+        ],
+        [
+            {
+                "key": s3_key("tenant-a", "doc-3"),
+                "distance": 0.3,
+            }
+        ],
+    ]
+
+    documents.documents = {
+        "doc-1": {
+            "text": "First",
+            "metadata": {"topic": "python"},
+        },
+        "doc-2": {
+            "text": "Second",
+            "metadata": {"topic": "python"},
+        },
+        "doc-3": {
+            "text": "Third",
+            "metadata": {"topic": "python"},
+        },
+    }
+
+    async with client:
+        results = [
+            result
+            async for result in client.asearch_stream(
+                vector=[0.1, 0.2, 0.3, 0.4],
+                top_k=3,
+                namespace="tenant-a",
+                filter={"topic": "python"},
+                page_size=2,
+            )
+        ]
+
+    assert [result.id for result in results] == [
+        "doc-1",
+        "doc-2",
+        "doc-3",
+    ]
+
+    assert documents.get_calls == [
+        (
+            "tenant-a",
+            ["doc-1", "doc-2"],
+        ),
+        (
+            "tenant-a",
+            ["doc-3"],
+        ),
+    ]
+
+    assert len(vectors.query_page_calls) == 1
+
+    call = vectors.query_page_calls[0]
+
+    assert call["top_k"] == 3
+    assert call["page_size"] == 2
+    assert call["filter"] == {
+        "$and": [
+            {"topic": "python"},
+            {NS_METADATA_KEY: "tenant-a"},
+        ]
+    }
+
+
+async def test_asearch_stream_stops_at_top_k():
+    client, vectors, documents = _client()
+
+    vectors.query_page_results = [
+        [
+            {
+                "key": s3_key("default", "doc-1"),
+                "distance": 0.1,
+            },
+            {
+                "key": s3_key("default", "doc-2"),
+                "distance": 0.2,
+            },
+            {
+                "key": s3_key("default", "doc-3"),
+                "distance": 0.3,
+            },
+        ]
+    ]
+
+    documents.documents = {
+        "doc-1": {"text": "First", "metadata": {}},
+        "doc-2": {"text": "Second", "metadata": {}},
+        "doc-3": {"text": "Third", "metadata": {}},
+    }
+
+    async with client:
+        results = [
+            result
+            async for result in client.asearch_stream(
+                vector=[0.1, 0.2, 0.3, 0.4],
+                top_k=2,
+            )
+        ]
+
+    assert [result.id for result in results] == [
+        "doc-1",
+        "doc-2",
+    ]
